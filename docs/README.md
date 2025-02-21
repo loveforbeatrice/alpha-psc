@@ -30,7 +30,7 @@ Results can be saved in JSON, CSV, or plain text formats.
 
 *Please follow these steps.*
 
-    git clone https://github.com/your-repo/alpha-psc.git
+    git clone https://github.com/loveforbeatrice/alpha-psc.git
     cd alpha-psc
     ./setup.sh
 
