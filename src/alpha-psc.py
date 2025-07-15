@@ -7,6 +7,7 @@ from threading import Thread
 from queue import Queue
 from scapy.all import *
 
+
 # Hedefi test eden worker fonksiyonu
 def scan_worker(queue, results, scan_type):
     while not queue.empty():
