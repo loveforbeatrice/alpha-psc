@@ -1,119 +1,134 @@
 #!/usr/bin/env python3
 import argparse
-import socket
-import json
 import csv
-import os
-import threading
-import subprocess
-from colorama import init, Fore
+import json
+import time
+from threading import Thread
+from queue import Queue
+from scapy.all import *
 
-def activate_venv():
-    print("Activating Virtual environment ...")
-    subprocess.call([os.path.expanduser('~/alpha-psc-env/bin/activate')], shell=True)
-
-    
-
-
-init(autoreset=True)
-
-def log_result(message):
-    with open("scan.log", "a") as log_file:
-        log_file.write(message + "\n")
-
-def scan_port(ip, port, scan_type):
-    try:
-        if scan_type == 'tcp':
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex((ip, port))
-            sock.close()
-            return result == 0
-        elif scan_type == 'udp':
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(1)
-            try:
-                sock.sendto(b'', (ip, port))
-                sock.recvfrom(1024)
-                return True
-            except socket.timeout:
-                return False
-            finally:
-                sock.close()
-    except Exception as e:
-        print(Fore.RED + f"Error scanning {ip}:{port} - {e}")
-        return False
-
-def save_result(target, port, output_format, file):
-    if output_format == 'json':
-        result = {"target": target, "port": port}
-        file.write(json.dumps(result) + "\n")
-    elif output_format == 'csv':
-        writer = csv.writer(file)
-        writer.writerow([target, port])
-    elif output_format == 'txt':
-        file.write(f"{target}:{port}\n")
-
-def scan_target(target, ports, scan_type, output_format, output_file):
-    with open(output_file, 'a', newline='') as f:
-        if output_format == 'csv' and os.stat(output_file).st_size == 0:
-            writer = csv.writer(f)
-            writer.writerow(['Target', 'Port'])
-        for port in ports:
-            print(Fore.CYAN + f"Scanning {target}:{port}...")  
-            if scan_port(target, port, scan_type):
-                success_msg = f"[OPEN] {target}:{port}"
-                print(Fore.GREEN + success_msg)  
-                log_result(success_msg)  
-                save_result(target, port, output_format, f)
+# Hedefi test eden worker fonksiyonu
+def scan_worker(queue, results, scan_type):
+    while not queue.empty():
+        ip, port = queue.get()
+        try:
+            if scan_type == "tcp":
+                is_open = scan_tcp_syn(ip, port)
             else:
-                print(Fore.RED + f"[CLOSED] {target}:{port}")  
+                is_open = scan_udp(ip, port)
+            results.append({"ip": ip, "port": port, "open": is_open, "protocol": scan_type})
+        except Exception as e:
+            results.append({"ip": ip, "port": port, "open": False, "protocol": scan_type, "error": str(e)})
+        queue.task_done()
 
-def thread_scan(targets, ports, scan_type, output_format, output_file):
+# TCP SYN Scan fonksiyonu
+def scan_tcp_syn(ip, port):
+    pkt = IP(dst=ip) / TCP(dport=port, sport=RandShort(), flags="S")
+    resp = sr1(pkt, timeout=1, verbose=0)
+    if resp is None:
+        return False
+    if resp.haslayer(TCP):
+        if resp[TCP].flags == 0x12:  # SYN-ACK
+            # Bağlantıyı kapatmak için RST gönder
+            rst_pkt = IP(dst=ip) / TCP(dport=port, sport=pkt[TCP].sport, flags="R")
+            send(rst_pkt, verbose=0)
+            return True
+        elif resp[TCP].flags == 0x14:  # RST-ACK
+            return False
+    return False
+
+# UDP Scan fonksiyonu
+def scan_udp(ip, port):
+    pkt = IP(dst=ip) / UDP(dport=port)
+    resp = sr1(pkt, timeout=2, verbose=0)
+    if resp is None:
+        return True  # Cevap yok, port açık ya da filtrelenmiş olabilir
+    if resp.haslayer(ICMP):
+        if resp[ICMP].type == 3 and resp[ICMP].code == 3:
+            return False  # Port kapalı (ICMP unreachable)
+        else:
+            return True
+    return True
+
+# Sonuçları yazdırma fonksiyonu
+def print_results(results):
+    for r in results:
+        status = "OPEN" if r["open"] else "CLOSED"
+        print(f'{r["ip"]}:{r["port"]}/{r["protocol"].upper()} -> {status}')
+
+# CSV olarak kaydet
+def save_csv(results, filename):
+    keys = ["ip", "port", "protocol", "open", "error"]
+    with open(filename, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(results)
+
+# JSON olarak kaydet
+def save_json(results, filename):
+    with open(filename, "w") as f:
+        json.dump(results, f, indent=2)
+
+# Düz metin olarak kaydet
+def save_txt(results, filename):
+    with open(filename, "w") as f:
+        for r in results:
+            status = "OPEN" if r["open"] else "CLOSED"
+            line = f'{r["ip"]}:{r["port"]}/{r["protocol"].upper()} -> {status}\n'
+            f.write(line)
+
+def main():
+    parser = argparse.ArgumentParser(description="Scapy TCP/UDP Port Scanner")
+    parser.add_argument("-t", "--target", required=True, help="Target IP or hostname")
+    parser.add_argument("-p", "--ports", default="1-1024", help="Ports to scan, e.g. 22,80,443 or 1-1024")
+    parser.add_argument("-st", "--scan-type", choices=["tcp", "udp"], default="tcp", help="Scan type (tcp or udp)")
+    parser.add_argument("-o", "--output", choices=["txt", "csv", "json"], default="txt", help="Output format")
+    parser.add_argument("-th", "--threads", type=int, default=100, help="Number of threads")
+    args = parser.parse_args()
+
+    # Hedef IP çözümle
+    try:
+        target_ip = socket.gethostbyname(args.target)
+    except Exception as e:
+        print(f"Invalid target: {e}")
+        return
+
+    # Port listesini oluştur
+    ports = []
+    for part in args.ports.split(","):
+        if "-" in part:
+            start, end = part.split("-")
+            ports.extend(range(int(start), int(end) + 1))
+        else:
+            ports.append(int(part))
+
+    q = Queue()
+    results = []
+
+    for port in ports:
+        q.put((target_ip, port))
+
     threads = []
-    for target in targets:
-        t = threading.Thread(target=scan_target, args=(target, ports, scan_type, output_format, output_file))
+    for _ in range(min(args.threads, q.qsize())):
+        t = Thread(target=scan_worker, args=(q, results, args.scan_type))
+        t.daemon = True
         t.start()
         threads.append(t)
 
-    for t in threads:
-        t.join()
+    q.join()
 
-def main():
+    # Sonuçları yazdır ve kaydet
+    print_results(results)
 
-    activate_venv()
-
-    parser = argparse.ArgumentParser(description="Alpha Port Scanner (alpha-psc)")
-    parser.add_argument('-t', '--target', required=True, help="Target IP, domain, or file containing a list of targets")
-    parser.add_argument('-st', '--scan-type', choices=['tcp', 'udp'], required=True, help="Scan type: TCP or UDP")
-    parser.add_argument('-p', '--ports', help="Ports to scan (e.g., 80,443 or 1-1000)")
-    parser.add_argument('-o', '--output', choices=['json', 'csv', 'txt'], required=True, help="Output format: json, csv, or txt")
-    args = parser.parse_args()
-
-    targets = []
-    if args.target.endswith('.txt'):
-        with open(args.target, 'r') as f:
-            targets = [line.strip() for line in f.readlines()]
+    filename = f"scan_results_{int(time.time())}.{args.output}"
+    if args.output == "csv":
+        save_csv(results, filename)
+    elif args.output == "json":
+        save_json(results, filename)
     else:
-        targets = [args.target]
+        save_txt(results, filename)
 
-    if args.ports:
-        if '-' in args.ports:
-            start, end = map(int, args.ports.split('-'))
-            ports = list(range(start, end + 1))
-        else:
-            ports = list(map(int, args.ports.split(',')))
-    else:
-        ports = list(range(1, 65536))
+    print(f"Results saved to {filename}")
 
-    output_filename = f"scan_results.{args.output}"
-    open(output_filename, 'w').close()  
-    open("scan.log", 'w').close()  
-
-    thread_scan(targets, ports, args.scan_type, args.output, output_filename)
-
-    print(Fore.YELLOW + f"Scan completed. Results saved to {output_filename} and log saved to scan.log")
-
-    
 if __name__ == "__main__":
     main()
